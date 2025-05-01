@@ -1,0 +1,190 @@
+---
+title: "Model 3 - Response Prediction MM"
+author: "Cristina Gómez-Martín"
+date: "1st May 2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+  knitr::opts_chunk$set(echo = TRUE)
+  suppressWarnings({ 
+    log(-1) 
+  })
+  library("ggplot2")
+  library("ggsci")
+  library("pROC")
+```
+
+# Get annotation
+
+```{r}
+  annotation<-read.table("../sampleSheet_model3.txt",header = T,sep = "\t",row.names=1)
+  row.names(annotation) <- gsub("-", ".", row.names(annotation))
+  annotation$sample <- gsub("-", ".", annotation$sample)
+  annotation
+```
+
+# Model Building
+
+## 1. Get miRNA data
+
+```{r}
+  df<-read.table("isomiRs_RPMlib.txt",header = T,sep = "\t",row.names = 1)
+  colnames(df) <- gsub("-", ".", colnames(df))
+  df <- na.omit(df)
+  keep <- rowSums(df>0) > 0
+  df <- df[keep, ]
+  genes <- rownames(df)[grep("*Hsa", rownames(df))]
+  
+  dfModel <- df[genes,]
+```
+
+## 2. Filter data (at least one third of the observations not zero)
+
+```{r}
+  totalBuildingCohort = 17
+  keep <- rowSums(dfModel > 0) >= (totalBuildingCohort/3)
+  analysis_df <- dfModel[keep,]
+  dim(analysis_df)
+```
+
+## 3. Create the train and test dataframes
+
+```{r}
+
+#Responders in 6 months
+  responders <- annotation[annotation$group == 'Response',]
+  sample_size = floor((2/3)*length(responders$sample))
+
+  picked = sample(seq_len(nrow(responders)),size = sample_size)
+  train_responder = responders[picked,]$sample
+  test_responder = responders[-picked,]$sample
+  
+#NonResponder in 6 months
+  ADs <- annotation[annotation$group == 'AD',]
+  sample_size = floor((2/3)*length(ADs$sample))
+  
+  picked = sample(seq_len(nrow(ADs)),size = sample_size)
+  train_nonresponder = ADs[picked,]$sample
+  test_nonresponder = ADs[-picked,]$sample
+  
+  train_samples <- c(train_responder,train_nonresponder)
+  response_train <- c(rep("Response",length(train_responder)),rep("AD",
+                    length(train_nonresponder)))
+  
+  test_samples <- c(test_responder,test_nonresponder)
+  response_test <- c(rep("Response",length(test_responder)),rep("AD",
+                    length(test_nonresponder)))
+  
+  #Train and test df
+  analysisDf <- t(analysis_df)
+  train <- analysisDf[train_samples,]
+  test <- analysisDf[test_samples,]
+```
+
+## 4. Create the lasso model
+
+```{r}
+  library(glmnet)
+  set.seed(12345)
+  alfa = 1
+  lasso.reg <- cv.glmnet(as.matrix(train), response_train,
+                           alpha = alfa, family="binomial", 
+                           type.measure="class", nfolds=3)
+  plot(lasso.reg)
+  #Best lambda = min_lambda
+  min_lambda <- lasso.reg$lambda.min
+            
+  #MCE of that model
+  mce <- lasso.reg$cvm[which(lasso.reg$lambda == lasso.reg$lambda.min)]
+  
+  #Optimal model -> Best lambda
+  lasso.opt = glmnet(x=train, 
+                       y=response_train, 
+                       alpha=alfa,standarize=T, 
+                       lambda = min_lambda,family="binomial",nfolds=3,type.measure="class")
+            
+            
+    bestModel <- lasso.opt
+    regBestModel <- lasso.reg
+    bestMCE = mce
+    alfaB <- alfa
+```
+
+```{r eval=FALSE, include=FALSE}
+  library(glmnet)
+  bestMCE = 1
+
+  mirnas <- c()
+  error <- c()
+
+  alfa = 1
+  for (myseed in seq(from=2000, to=3000, by=1)){
+    set.seed(myseed)
+    lasso.reg <- cv.glmnet(as.matrix(train), response_train,
+                             alpha = alfa, family="binomial", 
+                             type.measure="class", nfolds=3)
+    mce <- lasso.reg$cvm[which(lasso.reg$lambda == lasso.reg$lambda.min)]
+
+    #Best lambda = min_lambda
+    min_lambda <- lasso.reg$lambda.min
+    
+    lasso.opt = glmnet(x=train, 
+                    y=response_train, 
+                    alpha=alfa,standarize=T, 
+                    lambda = min_lambda,family="binomial",nfolds=3,type.measure="class")
+    prediction_train <- predict(lasso.opt, as.matrix(train), type = "response")
+    aucTest = round(pROC::auc(response_train, prediction_train),4)
+    if (aucTest == 1 ){
+        if (mce<=bestMCE){
+          bestModel <- lasso.opt
+          bestMCE = mce
+          bestSeed = myseed
+          regBestModel <- lasso.reg
+     }
+    }        
+
+  }
+  plot(regBestModel)
+```
+
+# Model performance
+
+## ROC of the training model (bootstrapped 2000 times)
+
+```{r}
+  prediction_train <- predict(bestModel, as.matrix(train), type = "response")
+  gModTrain <- pROC::roc(response_train ~ prediction_train, plot = TRUE, print.auc = TRUE,ci=TRUE)
+
+  ROCtrain <- pROC::coords(gModTrain, "best", ret=c("ci","auc","threshold", "sens", "spec", "ppv", "npv"))
+  thresholdTrain <- ROCtrain$threshold
+  
+  ciobj <- pROC::ci.se(gModTrain, specificities=seq(0, 1, l=25))
+  dat.ci <- data.frame(x = as.numeric(rownames(ciobj)),
+                       lower = ciobj[, 1],
+                       upper = ciobj[, 3])
+
+```
+
+## Test in validation samples
+
+```{r}
+  prediction <- predict(bestModel, as.matrix(test), type = "response")
+  
+  #define object to plot and calculate AUC
+  rocClassical <- pROC::roc(response_test, prediction,threshold=thresholdTrain,ci=TRUE)
+  
+  #create ROC plot
+    pROC::ggroc(list(rocTrain,rocClassical),aes = c("linewidth","color","linetype")) +
+      theme_bw()+
+      theme(axis.text=element_text(size=18,color="black"),axis.title=element_text(size=26))+
+      ylab("Sensitivity")+
+      xlab("1-Specificity")+
+      scale_color_manual(values=c( "black","#083566"))+
+      scale_discrete_manual("linewidth", values = c(1,2,2))+
+      scale_discrete_manual("linetype", values = c("dashed","solid"))+
+    scale_y_continuous(breaks = round(seq(0, 1, by = 0.2),1))+
+    scale_x_reverse(breaks = round(seq(0, 1, by = 0.2),1))+
+  theme(legend.position="none")
+  
+```
